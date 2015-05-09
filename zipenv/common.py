@@ -1,3 +1,5 @@
+import fnmatch
+import traceback
 import sys
 import os
 import imp
@@ -17,11 +19,11 @@ def relpath(parent, path):
 class ManagesSitePackages(object):
     SITE_PACKAGES_FILE = 'site_packages.txt'
 
-    def __init__(self, path, opener=None):
+    def __init__(self, path, opener=open):
         self.path = path
         self.site_packages_file = os.path.join(self.path,
                                                self.SITE_PACKAGES_FILE)
-        self.open = opener or open
+        self.open = opener
 
     def open_site_packages_file(self, mode='r'):
         return self.open(self.site_packages_file, mode)
@@ -49,10 +51,54 @@ class ManagesSitePackages(object):
             for site_packages in site_packages_directories:
                 f.write(site_packages + '\n')
 
-    def readlines(self):
+    def iter_site_packages(self):
         with self.open_site_packages_file() as f:
             for line in f:
                 yield line.strip()
+
+
+def addpackagefromzip(zipfile_instance, sitedir, path, known_paths):
+    with zipfile_instance.open(path, 'rU') as f:
+        for n, line in enumerate(f):
+            if line.startswith('#'):
+                continue
+            try:
+                if line.startswith(('import ', 'import\t')):
+                    exec line
+                    continue
+                line = line.rstrip()
+                dir = os.path.join(sitedir, line)
+                dircase = os.path.normcase(dir)
+                if not dircase in known_paths and os.path.exists(dir):
+                    sys.path.append(dir)
+                    known_paths.add(dircase)
+            except Exception:
+                print >>sys.stderr, ('Error processing line'
+                                     ' {:d} of {}:\n'.format(
+                                         n+1, path))
+                for record in traceback.format_exception(*sys.exc_info()):
+                    for line in record.splitlines():
+                        print >>sys.stderr, '  '+line
+                print >>sys.stderr, '\nRemainder of file ignored'
+                break
+
+
+def addpackagesfromzip(zipfile_instance, zipimporter_instance):
+    names = [info_object.filename
+             for info_object in zipfile_instance.infolist()]
+
+    known_paths = set()
+
+    sitedir = os.path.join(zipimporter_instance.archive,
+                           zipimporter_instance.prefix)
+
+    pth_pattern = os.path.join(zipimporter_instance.prefix, '*.pth')
+
+    for pth in fnmatch.filter(names, pth_pattern):
+        addpackagefromzip(zipfile_instance=zipfile_instance,
+                          sitedir=sitedir,
+                          path=pth,
+                          known_paths=known_paths)
 
 
 class ZipImporterLoadsExtension(object):
@@ -95,7 +141,7 @@ class ZipImporterFindsExtensions(zipimporter):
         return finder
 
     def find_so(self, fullname, path):
-        _, _, module_path_no_ext = fullname.rpartition('.')
+        parent, _, module_path_no_ext = fullname.rpartition('.')
 
         path = path or [self.prefix]
 
@@ -113,10 +159,17 @@ class ZipImporterFindsExtensions(zipimporter):
 
 def _replace_zipimporter():
     zip_path = os.path.dirname(__file__)
+
+    zipfile_instance = zipfile.ZipFile(zip_path)
+
     manager = ManagesSitePackages(path='',
-                                  opener=zipfile.ZipFile(zip_path).open)
+                                  opener=zipfile_instance.open)
 
     sys.path_hooks = [ZipImporterFindsExtensions(os.path.join(zip_path,
                                                               site_packages))
-                      for site_packages in manager.readlines()]
+                      for site_packages in manager.iter_site_packages()]
+
     sys.path_importer_cache.pop(zip_path)
+
+    for hook in sys.path_hooks:
+        addpackagesfromzip(zipfile_instance, hook)
